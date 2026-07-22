@@ -18,7 +18,7 @@ import { PatientModule } from './patient/patient.module';
       database: 'Schedula',
 
       autoLoadEntities: true,
-      synchronize: true,
+      synchronize: false,
     }),
  UsersModule,
  AuthModule,
