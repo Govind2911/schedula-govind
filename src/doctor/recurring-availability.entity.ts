@@ -7,11 +7,7 @@ import {
   UpdateDateColumn,
 } from 'typeorm';
 import { DoctorProfile } from './doctor-profile.entity';
-
-export enum AvailabilityType {
-  VIEW = 'VIEW',
-  STREAM = 'STREAM',
-}
+import { AvailabilityType } from './enums/availability-type.enum';
 
 @Entity('recurring_availability')
 export class RecurringAvailability {
@@ -24,7 +20,7 @@ export class RecurringAvailability {
   @Column({
     type: 'enum',
     enum: AvailabilityType,
-    default: AvailabilityType.VIEW,
+    default: AvailabilityType.STREAM,
   })
   type!: AvailabilityType;
 
@@ -36,6 +32,9 @@ export class RecurringAvailability {
 
   @Column()
   duration!: number;
+
+  @Column({ default: 0 })
+  bufferTime!: number;
 
   @Column()
   capacity!: number;

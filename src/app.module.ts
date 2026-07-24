@@ -8,6 +8,7 @@ import { DoctorModule } from './doctor/doctor.module';
 import { PatientModule } from './patient/patient.module';
 import { RecurringAvailability} from './doctor/recurring-availability.entity';
 import { CustomAvailability } from './doctor/custom-availability.entity';
+import { AppointmentModule } from './appointment/appointment.module';
 @Module({
   imports: [
  TypeOrmModule.forRoot({
@@ -16,7 +17,7 @@ import { CustomAvailability } from './doctor/custom-availability.entity';
       port: 5432,
       username: 'postgres',
       password: 'root123',
-      database: 'Schedula',
+      database: 'schedula',
 
       autoLoadEntities: true,
       synchronize: false,
@@ -26,7 +27,7 @@ import { CustomAvailability } from './doctor/custom-availability.entity';
  DoctorModule,
  PatientModule,
  RecurringAvailability, 
- CustomAvailability,
+ CustomAvailability, AppointmentModule,
   ],
   controllers: [AppController],
   providers: [AppService],

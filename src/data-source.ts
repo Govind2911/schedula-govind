@@ -7,7 +7,7 @@ export const AppDataSource = new DataSource({
   port: 5432,
   username: 'postgres',
   password: 'root123',
-  database: 'Schedula',
+  database: 'schedula',
 
   entities: ['src/**/*.entity.ts'],
   migrations: ['src/migrations/*.ts'],
