@@ -1,3 +1,7 @@
+import { OneToOne } from 'typeorm';
+import { DoctorProfile } from '../doctor/doctor-profile.entity';
+import { PatientProfile } from '../patient/patient-profile.entity';
+
 import {
   Entity,
   PrimaryGeneratedColumn,
@@ -33,9 +37,16 @@ export class User {
   })
   role!: Role;
 
+  @OneToOne(() => DoctorProfile, (doctorProfile) => doctorProfile.user)
+  doctorProfile!: DoctorProfile;
+
+  @OneToOne(() => PatientProfile, (patientProfile) => patientProfile.user)
+  patientProfile!: PatientProfile;
+
   @CreateDateColumn()
   createdAt!: Date;
 
   @UpdateDateColumn()
   updatedAt!: Date;
+
 }
