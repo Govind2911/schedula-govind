@@ -6,7 +6,8 @@ import { UsersModule } from './users/users.module';
 import { AuthModule } from './auth/auth.module';
 import { DoctorModule } from './doctor/doctor.module';
 import { PatientModule } from './patient/patient.module';
-
+import { RecurringAvailability} from './doctor/recurring-availability.entity';
+import { CustomAvailability } from './doctor/custom-availability.entity';
 @Module({
   imports: [
  TypeOrmModule.forRoot({
@@ -24,6 +25,8 @@ import { PatientModule } from './patient/patient.module';
  AuthModule,
  DoctorModule,
  PatientModule,
+ RecurringAvailability, 
+ CustomAvailability,
   ],
   controllers: [AppController],
   providers: [AppService],
