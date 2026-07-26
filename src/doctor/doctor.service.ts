@@ -15,6 +15,7 @@ import { CustomAvailability } from './custom-availability.entity';
 import { CreateRecurringAvailabilityDto } from './dto/create-recurring-availability.dto';
 import { UpdateRecurringAvailabilityDto } from './dto/update-recurring-availability.dto';
 import { CreateCustomAvailabilityDto } from './dto/create-custom-availability.dto';
+import { AvailabilityType } from './enums/availability-type.enum';
 
 @Injectable()
 export class DoctorService {
@@ -129,7 +130,9 @@ export class DoctorService {
         'Start time must be before end time',
       );
     }
-    
+
+    this.validateAvailabilityConfig(dto);
+
     const existingAvailability =
   await this.recurringAvailabilityRepository.findOne({
     where: {
@@ -313,6 +316,43 @@ async createCustomAvailability(
     );
   }
 
+  this.validateAvailabilityConfig(dto);
+
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+  const targetDate = new Date(dto.date);
+
+  if (Number.isNaN(targetDate.getTime())) {
+    throw new BadRequestException('Invalid date');
+  }
+
+  if (targetDate < today) {
+    throw new BadRequestException(
+      'Cannot create availability for a past date',
+    );
+  }
+
+  const existingForDate =
+    await this.customAvailabilityRepository.find({
+      where: {
+        doctorProfile: {
+          id: doctor.id,
+        },
+        date: dto.date,
+      },
+    });
+
+  for (const slot of existingForDate) {
+    if (
+      dto.startTime < slot.endTime &&
+      dto.endTime > slot.startTime
+    ) {
+      throw new BadRequestException(
+        'Overlapping availability slot for this date',
+      );
+    }
+  }
+
   const availability =
     this.customAvailabilityRepository.create({
       ...dto,
@@ -322,6 +362,41 @@ async createCustomAvailability(
   return await this.customAvailabilityRepository.save(
     availability,
   );
+}
+
+private validateAvailabilityConfig(dto: {
+  type: AvailabilityType;
+  startTime: string;
+  endTime: string;
+  duration: number;
+  bufferTime?: number;
+  capacity: number;
+}) {
+  if (!dto.duration || dto.duration <= 0) {
+    throw new BadRequestException('Invalid slot duration');
+  }
+
+  if (dto.bufferTime !== undefined && dto.bufferTime < 0) {
+    throw new BadRequestException('Invalid buffer time');
+  }
+
+  if (!dto.capacity || dto.capacity < 1) {
+    throw new BadRequestException('Invalid capacity');
+  }
+
+  const [startHour, startMinute] = dto.startTime.split(':').map(Number);
+  const [endHour, endMinute] = dto.endTime.split(':').map(Number);
+  const windowMinutes =
+    endHour * 60 + endMinute - (startHour * 60 + startMinute);
+
+  if (dto.type === AvailabilityType.STREAM) {
+    const step = dto.duration + (dto.bufferTime ?? 0);
+    if (step > windowMinutes) {
+      throw new BadRequestException(
+        'Slot duration and buffer time exceed the availability window',
+      );
+    }
+  }
 }
 
 async getAvailabilityByDate(

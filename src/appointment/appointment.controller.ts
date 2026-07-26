@@ -52,6 +52,19 @@ getAvailability(
     date,
   );
 }
+
+// Patient-facing view: exact time slots for STREAM, grouped
+// window + Available x/y for WAVE.
+@Get('slots/:doctorId/:date')
+getSlots(
+  @Param('doctorId') doctorId: string,
+  @Param('date') date: string,
+) {
+  return this.appointmentService.getPatientAvailability(
+    +doctorId,
+    date,
+  );
+}
   @Get(':id')
   findOne(@Param('id') id: string) {
     return this.appointmentService.findOne(+id);
