@@ -64,10 +64,22 @@ export class AppointmentService {
     return now.getHours() * 60 + now.getMinutes();
   }
 
+  private todayIso(): string {
+    return new Date().toISOString().slice(0, 10);
+  }
+
   // ==========================================
-  // STREAM SLOT GENERATION
+  // WINDOW SUBDIVISION (shared by STREAM & WAVE)
   // ==========================================
-  private generateStreamSlots(
+  //
+  // STREAM: `duration` here is the DERIVED per-patient duration (window
+  // evenly split across capacity) - each generated window is a single
+  // patient's exact appointment.
+  //
+  // WAVE: `duration` here is the mini-window size the doctor entered
+  // directly - each generated window is a shared wave, capacity patients
+  // can book into it, and get a token number based on order.
+  private generateWindows(
     startTime: string,
     endTime: string,
     duration: number,
@@ -91,22 +103,22 @@ export class AppointmentService {
     }
 
     const step = duration + (bufferTime ?? 0);
-    const slots: { startTime: string; endTime: string }[] = [];
+    const windows: { startTime: string; endTime: string }[] = [];
 
     let cursor = start;
     while (cursor + duration <= end) {
-      slots.push({
+      windows.push({
         startTime: this.minutesToTime(cursor),
         endTime: this.minutesToTime(cursor + duration),
       });
       cursor += step;
     }
 
-    return slots;
+    return windows;
   }
 
   // ==========================================
-  // PATIENT-FACING AVAILABILITY (SLOTS / WAVE WINDOW)
+  // PATIENT-FACING AVAILABILITY
   // ==========================================
   async getPatientAvailability(doctorId: number, date: string) {
     const doctor = await this.doctorRepository.findOne({
@@ -122,7 +134,7 @@ export class AppointmentService {
     }
 
     const dayOfWeek = this.getDayOfWeek(date);
-    const isToday = !this.isDateInPast(date) && date === new Date().toISOString().slice(0, 10);
+    const isToday = !this.isDateInPast(date) && date === this.todayIso();
 
     // Custom (date-specific) availability overrides recurring availability.
     const customEntries = await this.customRepository.find({
@@ -147,39 +159,37 @@ export class AppointmentService {
       };
     }
 
-    // Existing bookings for this doctor/date, used to mark slots booked
-    // and to compute wave counts.
     const bookedAppointments = await this.appointmentRepository.find({
       where: { doctor: { id: doctorId }, appointmentDate: date },
     });
 
     const sessions = sourceEntries.map((entry) => {
+      const rawWindows = this.generateWindows(
+        entry.startTime,
+        entry.endTime,
+        entry.duration,
+        entry.bufferTime ?? 0,
+      );
+
+      const futureWindows = rawWindows.filter((w) => {
+        if (!isToday) return true;
+        return this.timeToMinutes(w.startTime) > this.nowMinutes();
+      });
+
       if (entry.type === AvailabilityType.STREAM) {
-        const rawSlots = this.generateStreamSlots(
-          entry.startTime,
-          entry.endTime,
-          entry.duration,
-          entry.bufferTime ?? 0,
-        );
+        // Each window is exactly one patient's exact appointment slot.
+        const slots = futureWindows.map((slot) => {
+          const isBooked = bookedAppointments.some(
+            (appt) =>
+              appt.startTime === slot.startTime && appt.status === 'BOOKED',
+          );
 
-        const slots = rawSlots
-          .filter((slot) => {
-            if (!isToday) return true;
-            return this.timeToMinutes(slot.startTime) > this.nowMinutes();
-          })
-          .map((slot) => {
-            const isBooked = bookedAppointments.some(
-              (appt) =>
-                appt.startTime === slot.startTime &&
-                appt.status === 'BOOKED',
-            );
-
-            return {
-              startTime: slot.startTime,
-              endTime: slot.endTime,
-              status: isBooked ? 'BOOKED' : 'AVAILABLE',
-            };
-          });
+          return {
+            startTime: slot.startTime,
+            endTime: slot.endTime,
+            status: isBooked ? 'BOOKED' : 'AVAILABLE',
+          };
+        });
 
         return {
           availabilityId: entry.id,
@@ -188,24 +198,33 @@ export class AppointmentService {
         };
       }
 
-      // WAVE
-      const bookedCount = bookedAppointments.filter(
-        (appt) =>
-          appt.startTime === entry.startTime &&
-          appt.endTime === entry.endTime &&
-          appt.status === 'BOOKED',
-      ).length;
+      // WAVE - each window is a shared mini-window (wave) with its own
+      // capacity and token count.
+      const windows = futureWindows.map((w) => {
+        const bookedCount = bookedAppointments.filter(
+          (appt) =>
+            appt.startTime === w.startTime &&
+            appt.endTime === w.endTime &&
+            appt.status === 'BOOKED',
+        ).length;
 
-      const available = Math.max(entry.capacity - bookedCount, 0);
+        const available = Math.max(entry.capacity - bookedCount, 0);
+
+        return {
+          timeWindow: `${w.startTime} - ${w.endTime}`,
+          startTime: w.startTime,
+          endTime: w.endTime,
+          capacity: entry.capacity,
+          booked: bookedCount,
+          available,
+          isFull: available === 0,
+        };
+      });
 
       return {
         availabilityId: entry.id,
         schedulingType: AvailabilityType.WAVE,
-        timeWindow: `${entry.startTime} - ${entry.endTime}`,
-        capacity: entry.capacity,
-        booked: bookedCount,
-        available,
-        isFull: available === 0,
+        windows,
       };
     });
 
@@ -270,9 +289,6 @@ export class AppointmentService {
     let recurringAvailability: RecurringAvailability | null = null;
     let customAvailability: CustomAvailability | null = null;
 
-    // -----------------------------
-    // RECURRING AVAILABILITY
-    // -----------------------------
     if (createAppointmentDto.recurringAvailabilityId) {
       recurringAvailability = await this.recurringRepository.findOne({
         where: { id: createAppointmentDto.recurringAvailabilityId },
@@ -300,9 +316,6 @@ export class AppointmentService {
       }
     }
 
-    // -----------------------------
-    // CUSTOM AVAILABILITY
-    // -----------------------------
     if (createAppointmentDto.customAvailabilityId) {
       customAvailability = await this.customRepository.findOne({
         where: { id: createAppointmentDto.customAvailabilityId },
@@ -326,53 +339,55 @@ export class AppointmentService {
       }
     }
 
-    const schedulingType = recurringAvailability?.type ?? customAvailability?.type;
+    const source = recurringAvailability ?? customAvailability!;
+    const schedulingType = source.type;
 
     if (!schedulingType) {
       throw new BadRequestException('Invalid scheduling type');
     }
 
+    if (!createAppointmentDto.startTime) {
+      throw new BadRequestException(
+        'Start time is required (pick one of the generated slots/waves for this availability)',
+      );
+    }
+
+    // Both STREAM and WAVE now generate discrete windows from the same
+    // availability row - STREAM windows are 1-patient exact slots, WAVE
+    // windows are shared mini-windows with their own capacity.
+    const windows = this.generateWindows(
+      source.startTime,
+      source.endTime,
+      source.duration,
+      source.bufferTime ?? 0,
+    );
+
+    const matchedWindow = windows.find(
+      (w) => w.startTime === createAppointmentDto.startTime,
+    );
+
+    if (!matchedWindow) {
+      throw new BadRequestException(
+        'Invalid or unavailable time slot for this availability',
+      );
+    }
+
+    if (
+      createAppointmentDto.appointmentDate === this.todayIso() &&
+      this.timeToMinutes(matchedWindow.startTime) <= this.nowMinutes()
+    ) {
+      throw new BadRequestException('Cannot book a past time slot');
+    }
+
     // ==========================================
-    // STREAM BOOKING
+    // STREAM BOOKING - exactly one patient per window
     // ==========================================
     if (schedulingType === AvailabilityType.STREAM) {
-      if (!createAppointmentDto.startTime) {
-        throw new BadRequestException(
-          'Start time is required for stream booking',
-        );
-      }
-
-      const source = recurringAvailability ?? customAvailability!;
-
-      const validSlots = this.generateStreamSlots(
-        source.startTime,
-        source.endTime,
-        source.duration,
-        source.bufferTime ?? 0,
-      );
-
-      const matchedSlot = validSlots.find(
-        (slot) => slot.startTime === createAppointmentDto.startTime,
-      );
-
-      if (!matchedSlot) {
-        throw new BadRequestException(
-          'Invalid or unavailable time slot for this availability',
-        );
-      }
-
-      if (
-        createAppointmentDto.appointmentDate === new Date().toISOString().slice(0, 10) &&
-        this.timeToMinutes(matchedSlot.startTime) <= this.nowMinutes()
-      ) {
-        throw new BadRequestException('Cannot book a past time slot');
-      }
-
       const duplicate = await this.appointmentRepository.findOne({
         where: {
           doctor: { id: doctor.id },
           appointmentDate: createAppointmentDto.appointmentDate,
-          startTime: matchedSlot.startTime,
+          startTime: matchedWindow.startTime,
           status: 'BOOKED',
         },
         relations: { doctor: true },
@@ -389,8 +404,8 @@ export class AppointmentService {
         customAvailability: customAvailability ?? undefined,
         appointmentDate: createAppointmentDto.appointmentDate,
         schedulingType,
-        startTime: matchedSlot.startTime,
-        endTime: matchedSlot.endTime,
+        startTime: matchedWindow.startTime,
+        endTime: matchedWindow.endTime,
         status: 'BOOKED',
       });
 
@@ -398,24 +413,16 @@ export class AppointmentService {
     }
 
     // ==========================================
-    // WAVE BOOKING
+    // WAVE BOOKING - up to `capacity` patients per mini-window, token
+    // assigned by booking order within that specific mini-window.
     // ==========================================
-    const source = recurringAvailability ?? customAvailability!;
-
-    if (
-      createAppointmentDto.appointmentDate === new Date().toISOString().slice(0, 10) &&
-      this.timeToMinutes(source.endTime) <= this.nowMinutes()
-    ) {
-      throw new BadRequestException('Cannot book a past time window');
-    }
-
     const alreadyBookedByPatient = await this.appointmentRepository.findOne({
       where: {
         doctor: { id: doctor.id },
         patient: { id: patient.id },
         appointmentDate: createAppointmentDto.appointmentDate,
-        startTime: source.startTime,
-        endTime: source.endTime,
+        startTime: matchedWindow.startTime,
+        endTime: matchedWindow.endTime,
         status: 'BOOKED',
       },
       relations: { doctor: true, patient: true },
@@ -431,8 +438,8 @@ export class AppointmentService {
       where: {
         doctor: { id: doctor.id },
         appointmentDate: createAppointmentDto.appointmentDate,
-        startTime: source.startTime,
-        endTime: source.endTime,
+        startTime: matchedWindow.startTime,
+        endTime: matchedWindow.endTime,
         status: 'BOOKED',
       },
       relations: { doctor: true },
@@ -455,8 +462,8 @@ export class AppointmentService {
       customAvailability: customAvailability ?? undefined,
       appointmentDate: createAppointmentDto.appointmentDate,
       schedulingType,
-      startTime: source.startTime,
-      endTime: source.endTime,
+      startTime: matchedWindow.startTime,
+      endTime: matchedWindow.endTime,
       tokenNumber: existingAppointments + 1,
       status: 'BOOKED',
     });

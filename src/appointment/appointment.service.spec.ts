@@ -71,6 +71,8 @@ describe('AppointmentService', () => {
 
   // ==========================================
   // STREAM SCHEDULING
+  // 10:00-12:00 window, capacity 6 -> 20 min per patient (derived),
+  // matching the "big window split evenly across capacity" model.
   // ==========================================
   describe('Stream scheduling', () => {
     const streamAvailability = {
@@ -78,10 +80,10 @@ describe('AppointmentService', () => {
       type: AvailabilityType.STREAM,
       dayOfWeek: FUTURE_DAY_OF_WEEK,
       startTime: '10:00',
-      endTime: '11:00',
-      duration: 15,
-      bufferTime: 5,
-      capacity: 1,
+      endTime: '12:00',
+      duration: 20, // derived by doctor.service at creation time
+      bufferTime: 0,
+      capacity: 6,
       doctorProfile: doctor,
     };
 
@@ -93,11 +95,11 @@ describe('AppointmentService', () => {
         doctorId: 1,
         appointmentDate: FUTURE_DATE,
         recurringAvailabilityId: 10,
-        startTime: '10:20',
+        startTime: '10:40',
       });
 
-      expect(result.startTime).toBe('10:20');
-      expect(result.endTime).toBe('10:35');
+      expect(result.startTime).toBe('10:40');
+      expect(result.endTime).toBe('11:00');
       expect(result.schedulingType).toBe(AvailabilityType.STREAM);
     });
 
@@ -128,7 +130,7 @@ describe('AppointmentService', () => {
       ).rejects.toThrow('Slot already booked');
     });
 
-    it('requires a start time for stream bookings', async () => {
+    it('requires a start time for booking', async () => {
       recurringRepository.findOne.mockResolvedValue(streamAvailability);
 
       await expect(
@@ -137,10 +139,10 @@ describe('AppointmentService', () => {
           appointmentDate: FUTURE_DATE,
           recurringAvailabilityId: 10,
         }),
-      ).rejects.toThrow('Start time is required for stream booking');
+      ).rejects.toThrow('Start time is required');
     });
 
-    it('generates correctly spaced exact slots for the patient view', async () => {
+    it('generates 6 equal 20-min exact slots across the 2-hour window for the patient view', async () => {
       customRepository.find.mockResolvedValue([]);
       recurringRepository.find.mockResolvedValue([streamAvailability]);
       appointmentRepository.find.mockResolvedValue([]);
@@ -149,16 +151,24 @@ describe('AppointmentService', () => {
 
       expect(result.sessions).toHaveLength(1);
       expect(result.sessions[0].schedulingType).toBe(AvailabilityType.STREAM);
-      expect(result.sessions[0].slots).toEqual([
-        { startTime: '10:00', endTime: '10:15', status: 'AVAILABLE' },
-        { startTime: '10:20', endTime: '10:35', status: 'AVAILABLE' },
-        { startTime: '10:40', endTime: '10:55', status: 'AVAILABLE' },
-      ]);
+      expect(result.sessions[0].slots).toHaveLength(6);
+      expect(result.sessions[0]!.slots![0]).toEqual({
+        startTime: '10:00',
+        endTime: '10:20',
+        status: 'AVAILABLE',
+      });
+      expect(result.sessions[0]!.slots![5]).toEqual({
+        startTime: '11:40',
+        endTime: '12:00',
+        status: 'AVAILABLE',
+      });
     });
   });
 
   // ==========================================
   // WAVE SCHEDULING
+  // 10:00-12:00 window, duration 30 (entered directly), capacity 4 per
+  // mini-window -> four 30-min waves, 4 patients each.
   // ==========================================
   describe('Wave scheduling', () => {
     const waveAvailability = {
@@ -166,44 +176,72 @@ describe('AppointmentService', () => {
       type: AvailabilityType.WAVE,
       dayOfWeek: FUTURE_DAY_OF_WEEK,
       startTime: '10:00',
-      endTime: '11:00',
-      duration: 15,
+      endTime: '12:00',
+      duration: 30,
       bufferTime: 0,
-      capacity: 5,
+      capacity: 4,
       doctorProfile: doctor,
     };
 
-    it('assigns sequential token numbers based on booking order', async () => {
+    it('generates four 30-min mini-windows, each with its own capacity', async () => {
+      customRepository.find.mockResolvedValue([]);
+      recurringRepository.find.mockResolvedValue([waveAvailability]);
+      appointmentRepository.find.mockResolvedValue([
+        { startTime: '10:00', endTime: '10:30', status: 'BOOKED' },
+        { startTime: '10:00', endTime: '10:30', status: 'BOOKED' },
+      ]);
+
+      const result = await service.getPatientAvailability(1, FUTURE_DATE);
+
+      expect(result.sessions[0].schedulingType).toBe(AvailabilityType.WAVE);
+      expect(result.sessions[0].windows).toHaveLength(4);
+      expect(result.sessions[0]!.windows![0]).toMatchObject({
+        timeWindow: '10:00 - 10:30',
+        capacity: 4,
+        booked: 2,
+        available: 2,
+        isFull: false,
+      });
+      expect(result.sessions[0]!.windows![1]).toMatchObject({
+        timeWindow: '10:30 - 11:00',
+        booked: 0,
+        available: 4,
+      });
+    });
+
+    it('assigns sequential token numbers within the chosen mini-window', async () => {
       recurringRepository.findOne.mockResolvedValue(waveAvailability);
       appointmentRepository.findOne.mockResolvedValue(null); // not already booked by this patient
-      appointmentRepository.count.mockResolvedValue(2); // 2 already booked
+      appointmentRepository.count.mockResolvedValue(2); // 2 already booked in this wave
 
       const result = await service.create(1, {
         doctorId: 1,
         appointmentDate: FUTURE_DATE,
         recurringAvailabilityId: 20,
+        startTime: '10:30',
       });
 
       expect(result.tokenNumber).toBe(3);
-      expect(result.startTime).toBe('10:00');
+      expect(result.startTime).toBe('10:30');
       expect(result.endTime).toBe('11:00');
     });
 
-    it('rejects booking once the wave is at full capacity', async () => {
+    it('rejects booking once that specific mini-window is at full capacity', async () => {
       recurringRepository.findOne.mockResolvedValue(waveAvailability);
       appointmentRepository.findOne.mockResolvedValue(null);
-      appointmentRepository.count.mockResolvedValue(5); // capacity reached
+      appointmentRepository.count.mockResolvedValue(4); // capacity reached
 
       await expect(
         service.create(1, {
           doctorId: 1,
           appointmentDate: FUTURE_DATE,
           recurringAvailabilityId: 20,
+          startTime: '10:00',
         }),
       ).rejects.toThrow('Wave is full');
     });
 
-    it('rejects a duplicate booking by the same patient in the same wave', async () => {
+    it('rejects a duplicate booking by the same patient in the same mini-window', async () => {
       recurringRepository.findOne.mockResolvedValue(waveAvailability);
       appointmentRepository.findOne.mockResolvedValue({ id: 55 }); // already booked
 
@@ -212,28 +250,22 @@ describe('AppointmentService', () => {
           doctorId: 1,
           appointmentDate: FUTURE_DATE,
           recurringAvailabilityId: 20,
+          startTime: '11:00',
         }),
       ).rejects.toThrow('You have already booked a slot in this wave');
     });
 
-    it('reports available capacity as Available: booked/capacity for the patient view', async () => {
-      customRepository.find.mockResolvedValue([]);
-      recurringRepository.find.mockResolvedValue([waveAvailability]);
-      appointmentRepository.find.mockResolvedValue([
-        { startTime: '10:00', endTime: '11:00', status: 'BOOKED' },
-        { startTime: '10:00', endTime: '11:00', status: 'BOOKED' },
-      ]);
+    it('rejects a start time that does not match any generated mini-window', async () => {
+      recurringRepository.findOne.mockResolvedValue(waveAvailability);
 
-      const result = await service.getPatientAvailability(1, FUTURE_DATE);
-
-      expect(result.sessions[0]).toMatchObject({
-        schedulingType: AvailabilityType.WAVE,
-        timeWindow: '10:00 - 11:00',
-        capacity: 5,
-        booked: 2,
-        available: 3,
-        isFull: false,
-      });
+      await expect(
+        service.create(1, {
+          doctorId: 1,
+          appointmentDate: FUTURE_DATE,
+          recurringAvailabilityId: 20,
+          startTime: '10:15',
+        }),
+      ).rejects.toThrow('Invalid or unavailable time slot for this availability');
     });
   });
 
@@ -301,10 +333,10 @@ describe('AppointmentService', () => {
         type: AvailabilityType.STREAM,
         dayOfWeek: FUTURE_DAY_OF_WEEK,
         startTime: '10:00',
-        endTime: '11:00',
-        duration: 15,
+        endTime: '12:00',
+        duration: 20,
         bufferTime: 0,
-        capacity: 1,
+        capacity: 6,
         doctorProfile: { id: 999 },
       });
 
