@@ -15,6 +15,7 @@ import { PatientProfile } from '../patient/patient-profile.entity';
 import { RecurringAvailability } from '../doctor/recurring-availability.entity';
 import { CustomAvailability } from '../doctor/custom-availability.entity';
 import { AvailabilityType } from '../doctor/enums/availability-type.enum';
+import { AppointmentStatus } from './enums/appointment-status.enum';
 
 @Injectable()
 export class AppointmentService {
@@ -68,17 +69,6 @@ export class AppointmentService {
     return new Date().toISOString().slice(0, 10);
   }
 
-  // ==========================================
-  // WINDOW SUBDIVISION (shared by STREAM & WAVE)
-  // ==========================================
-  //
-  // STREAM: `duration` here is the DERIVED per-patient duration (window
-  // evenly split across capacity) - each generated window is a single
-  // patient's exact appointment.
-  //
-  // WAVE: `duration` here is the mini-window size the doctor entered
-  // directly - each generated window is a shared wave, capacity patients
-  // can book into it, and get a token number based on order.
   private generateWindows(
     startTime: string,
     endTime: string,
@@ -181,13 +171,13 @@ export class AppointmentService {
         const slots = futureWindows.map((slot) => {
           const isBooked = bookedAppointments.some(
             (appt) =>
-              appt.startTime === slot.startTime && appt.status === 'BOOKED',
+              appt.startTime === slot.startTime && appt.status === AppointmentStatus.BOOKED,
           );
 
           return {
             startTime: slot.startTime,
             endTime: slot.endTime,
-            status: isBooked ? 'BOOKED' : 'AVAILABLE',
+            status: isBooked ? AppointmentStatus.BOOKED : AppointmentStatus.AVAILABLE,
           };
         });
 
@@ -205,7 +195,7 @@ export class AppointmentService {
           (appt) =>
             appt.startTime === w.startTime &&
             appt.endTime === w.endTime &&
-            appt.status === 'BOOKED',
+            appt.status === AppointmentStatus.BOOKED,
         ).length;
 
         const available = Math.max(entry.capacity - bookedCount, 0);
@@ -388,7 +378,7 @@ export class AppointmentService {
           doctor: { id: doctor.id },
           appointmentDate: createAppointmentDto.appointmentDate,
           startTime: matchedWindow.startTime,
-          status: 'BOOKED',
+          status: AppointmentStatus.BOOKED,
         },
         relations: { doctor: true },
       });
@@ -406,11 +396,19 @@ export class AppointmentService {
         schedulingType,
         startTime: matchedWindow.startTime,
         endTime: matchedWindow.endTime,
-        status: 'BOOKED',
+        status: AppointmentStatus.BOOKED,
       });
 
-      return await this.appointmentRepository.save(appointment);
-    }
+      const saved =
+      await this.appointmentRepository.save(
+   appointment,
+  );
+
+ return {
+     message:'Appointment booked successfully',
+     appointment: saved,
+};
+}
 
     // ==========================================
     // WAVE BOOKING - up to `capacity` patients per mini-window, token
@@ -423,7 +421,7 @@ export class AppointmentService {
         appointmentDate: createAppointmentDto.appointmentDate,
         startTime: matchedWindow.startTime,
         endTime: matchedWindow.endTime,
-        status: 'BOOKED',
+        status: AppointmentStatus.BOOKED,
       },
       relations: { doctor: true, patient: true },
     });
@@ -440,7 +438,7 @@ export class AppointmentService {
         appointmentDate: createAppointmentDto.appointmentDate,
         startTime: matchedWindow.startTime,
         endTime: matchedWindow.endTime,
-        status: 'BOOKED',
+        status: AppointmentStatus.BOOKED,
       },
       relations: { doctor: true },
     });
@@ -465,10 +463,17 @@ export class AppointmentService {
       startTime: matchedWindow.startTime,
       endTime: matchedWindow.endTime,
       tokenNumber: existingAppointments + 1,
-      status: 'BOOKED',
+      status: AppointmentStatus.BOOKED,
     });
 
-    return await this.appointmentRepository.save(appointment);
+    const saved =
+        await this.appointmentRepository.save(appointment,);
+
+return {
+message:
+'Appointment booked successfully',
+appointment: saved,
+};
   }
 
   async getDoctorAvailability(doctorId: number, date: string) {
@@ -546,4 +551,115 @@ export class AppointmentService {
       message: 'Appointment deleted successfully',
     };
   }
+  async getMyAppointments(userId: number) {
+  const patient = await this.patientRepository.findOne({
+    where: {
+      user: {
+        id: userId,
+      },
+    },
+    relations: {
+      user: true,
+    },
+  });
+
+  if (!patient) {
+    throw new NotFoundException(
+      'Patient profile not found',
+    );
+  }
+
+  const appointments =
+    await this.appointmentRepository.find({
+      where: {
+        patient: {
+          id: patient.id,
+        },
+      },
+      relations: {
+        doctor: true,
+      },
+      order: {
+        appointmentDate: 'ASC',
+      },
+    });
+
+  if (!appointments.length) {
+    throw new NotFoundException(
+      'No appointments found',
+    );
+  }
+
+  return appointments;
+}
+
+async cancelAppointment(
+  appointmentId: number,
+  userId: number,
+) {
+  const patient = await this.patientRepository.findOne({
+    where: {
+      user: {
+        id: userId,
+      },
+    },
+  });
+
+  if (!patient) {
+    throw new NotFoundException(
+      'Patient profile not found',
+    );
+  }
+
+  const appointment =
+    await this.appointmentRepository.findOne({
+      where: {
+        id: appointmentId,
+      },
+      relations: {
+        patient: true,
+      },
+    });
+
+  if (!appointment) {
+    throw new NotFoundException(
+      'Appointment not found',
+    );
+  }
+
+  if (
+    appointment.patient.id !== patient.id
+  ) {
+    throw new BadRequestException(
+      'Unauthorized access',
+    );
+  }
+
+  if (
+    appointment.status ===
+    AppointmentStatus.CANCELLED
+  ) {
+    throw new BadRequestException(
+      'Appointment already cancelled',
+    );
+  }
+
+  if (
+    this.isDateInPast(
+      appointment.appointmentDate,
+    )
+  ) {
+    throw new BadRequestException(
+      'Past appointment cannot be cancelled',
+    );
+  }
+
+  appointment.status =
+    AppointmentStatus.CANCELLED;
+
+  return await this.appointmentRepository.save(
+    appointment,
+  );
+}
+
 }

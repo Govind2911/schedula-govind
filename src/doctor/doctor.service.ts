@@ -16,6 +16,8 @@ import { CreateRecurringAvailabilityDto } from './dto/create-recurring-availabil
 import { UpdateRecurringAvailabilityDto } from './dto/update-recurring-availability.dto';
 import { CreateCustomAvailabilityDto } from './dto/create-custom-availability.dto';
 import { AvailabilityType } from './enums/availability-type.enum';
+import { Appointment } from '../appointment/entities/appointment.entity';
+import { AppointmentStatus } from '../appointment/enums/appointment-status.enum';
 
 @Injectable()
 export class DoctorService {
@@ -31,6 +33,9 @@ export class DoctorService {
 
     @InjectRepository(CustomAvailability)
     private readonly customAvailabilityRepository: Repository<CustomAvailability>,
+
+    @InjectRepository(Appointment)
+    private readonly appointmentRepository: Repository<Appointment>,
   ) {}
 
   async createProfile(
@@ -473,5 +478,56 @@ async getAvailabilityByDate(
     },
   });
 }
+async getAppointments(userId: number) {
+  const doctor = await this.doctorRepository.findOne({
+    where: {
+      user: {
+        id: userId,
+      },
+    },
+    relations: {
+      user: true,
+    },
+  });
 
+  if (!doctor) {
+    throw new NotFoundException(
+      'Doctor profile not found',
+    );
+  }
+
+  const appointments =
+    await this.appointmentRepository.find({
+      where: {
+        doctor: {
+          id: doctor.id,
+        },
+      },
+      relations: {
+        patient: true,
+      },
+      order: {
+        appointmentDate: 'ASC',
+        startTime: 'ASC',
+      },
+    });
+
+  if (!appointments.length) {
+    throw new NotFoundException(
+      'No appointments found',
+    );
+  }
+
+  return appointments.map((appointment) => ({
+    id: appointment.id,
+    patient: appointment.patient,
+    appointmentDate:
+      appointment.appointmentDate,
+    startTime: appointment.startTime,
+    endTime: appointment.endTime,
+    tokenNumber:
+      appointment.tokenNumber,
+    status: appointment.status,
+  }));
+}
 }

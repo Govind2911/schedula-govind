@@ -5,6 +5,7 @@ import {
   ManyToOne,
   CreateDateColumn,
   UpdateDateColumn,
+  Unique,
 } from 'typeorm';
 
 import { DoctorProfile } from '../../doctor/doctor-profile.entity';
@@ -12,8 +13,15 @@ import { PatientProfile } from '../../patient/patient-profile.entity';
 import { AvailabilityType } from '../../doctor/enums/availability-type.enum';
 import { RecurringAvailability } from '../../doctor/recurring-availability.entity';
 import { CustomAvailability } from '../../doctor/custom-availability.entity';
+import { AppointmentStatus } from '../enums/appointment-status.enum';
 
 @Entity('appointments')
+@Unique([
+  'doctor',
+  'appointmentDate',
+  'startTime',
+  'endTime',
+])
 export class Appointment {
   @PrimaryGeneratedColumn()
   id!: number;
@@ -40,33 +48,43 @@ export class Appointment {
   })
   customAvailability?: CustomAvailability;
 
-  @Column({ type: 'date' })
+  @Column({
+    type: 'date',
+  })
   appointmentDate!: string;
 
   @Column({
-  type: 'enum',
-  enum: AvailabilityType,
-  default: AvailabilityType.STREAM,
-})
-schedulingType!: AvailabilityType;
+    type: 'enum',
+    enum: AvailabilityType,
+    default: AvailabilityType.STREAM,
+  })
+  schedulingType!: AvailabilityType;
 
-  @Column({ type: 'time' })
+  @Column({
+    type: 'time',
+  })
   startTime!: string;
 
-  @Column({ type: 'time' })
+  @Column({
+    type: 'time',
+  })
   endTime!: string;
 
-  @Column({ nullable: true })
+  @Column({
+    nullable: true,
+  })
   tokenNumber?: number;
 
   @Column({
-    default: 'BOOKED',
+    type: 'enum',
+    enum: AppointmentStatus,
+    default: AppointmentStatus.BOOKED,
   })
-  status!: string;
+  status!: AppointmentStatus;
 
   @CreateDateColumn()
   createdAt!: Date;
 
   @UpdateDateColumn()
- updatedAt!: Date;
+  updatedAt!: Date;
 }
