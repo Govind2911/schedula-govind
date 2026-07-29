@@ -6,7 +6,6 @@ import {
   IsString,
   Matches,
   Min,
-  ValidateIf,
 } from 'class-validator';
 import { AvailabilityType } from '../enums/availability-type.enum';
 
@@ -24,13 +23,13 @@ export class CreateCustomAvailabilityDto {
   @Matches(/^([01]\d|2[0-3]):([0-5]\d)$/)
   endTime!: string;
 
-  // Only required for WAVE, where it's the size of each mini-window
-  // (wave). For STREAM the per-patient duration is derived automatically
-  // by splitting the window evenly across `capacity`, so this field
-  // should be omitted.
-  @ValidateIf((o) => o.type === AvailabilityType.WAVE)
+  // Not required for either scheduling type: the per-patient slot length
+  // is always derived automatically by splitting the availability window
+  // evenly across `capacity` (accounting for `bufferTime` between
+  // consecutive patients). Any value sent here is ignored.
+  @IsOptional()
   @IsInt()
-  @Min(5)
+  @Min(1)
   duration?: number;
 
   @IsOptional()
@@ -38,9 +37,8 @@ export class CreateCustomAvailabilityDto {
   @Min(0)
   bufferTime?: number;
 
-  // STREAM: total number of patients across the whole window (used to
-  // derive the per-slot duration).
-  // WAVE: max patients per mini-window (wave).
+  // Total number of patients across the whole session, for both STREAM
+  // and WAVE. Used to derive the per-patient slot duration.
   @IsInt()
   @Min(1)
   capacity!: number;
