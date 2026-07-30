@@ -142,4 +142,13 @@ export class DoctorController {
       date,
     );
   }
+
+  @Get('appointments')
+@UseGuards(JwtAuthGuard, RolesGuard)
+@Roles(Role.DOCTOR)
+getAppointments(@Req() req) {
+  return this.doctorService.getAppointments(
+    req.user.userId,
+  );
+}
 }

@@ -167,8 +167,10 @@ describe('AppointmentService', () => {
 
   // ==========================================
   // WAVE SCHEDULING
-  // 10:00-12:00 window, duration 30 (entered directly), capacity 4 per
-  // mini-window -> four 30-min waves, 4 patients each.
+  // 10:00-12:00 window, capacity 4, buffer 5 -> duration is derived at
+  // availability-creation time (by doctor.service) the same way STREAM's
+  // is: (120 - 3*5) / 4 = 26.25 -> floored to 26. Each generated slot
+  // belongs to exactly one patient, same as STREAM.
   // ==========================================
   describe('Wave scheduling', () => {
     const waveAvailability = {
@@ -177,59 +179,65 @@ describe('AppointmentService', () => {
       dayOfWeek: FUTURE_DAY_OF_WEEK,
       startTime: '10:00',
       endTime: '12:00',
-      duration: 30,
-      bufferTime: 0,
+      duration: 26, // derived by doctor.service at creation time
+      bufferTime: 5,
       capacity: 4,
       doctorProfile: doctor,
     };
 
-    it('generates four 30-min mini-windows, each with its own capacity', async () => {
+    it('generates four one-patient slots split evenly across the session', async () => {
       customRepository.find.mockResolvedValue([]);
       recurringRepository.find.mockResolvedValue([waveAvailability]);
       appointmentRepository.find.mockResolvedValue([
-        { startTime: '10:00', endTime: '10:30', status: 'BOOKED' },
-        { startTime: '10:00', endTime: '10:30', status: 'BOOKED' },
+        { startTime: '10:00', endTime: '10:26', status: 'BOOKED' },
       ]);
 
       const result = await service.getPatientAvailability(1, FUTURE_DATE);
 
       expect(result.sessions[0].schedulingType).toBe(AvailabilityType.WAVE);
-      expect(result.sessions[0].windows).toHaveLength(4);
-      expect(result.sessions[0]!.windows![0]).toMatchObject({
-        timeWindow: '10:00 - 10:30',
-        capacity: 4,
-        booked: 2,
-        available: 2,
-        isFull: false,
+      expect(result.sessions[0].slots).toHaveLength(4);
+      expect(result.sessions[0]!.slots![0]).toEqual({
+        startTime: '10:00',
+        endTime: '10:26',
+        status: 'BOOKED',
       });
-      expect(result.sessions[0]!.windows![1]).toMatchObject({
-        timeWindow: '10:30 - 11:00',
-        booked: 0,
-        available: 4,
+      expect(result.sessions[0]!.slots![1]).toEqual({
+        startTime: '10:31',
+        endTime: '10:57',
+        status: 'AVAILABLE',
+      });
+      expect(result.sessions[0]!.slots![2]).toEqual({
+        startTime: '11:02',
+        endTime: '11:28',
+        status: 'AVAILABLE',
+      });
+      expect(result.sessions[0]!.slots![3]).toEqual({
+        startTime: '11:33',
+        endTime: '11:59',
+        status: 'AVAILABLE',
       });
     });
 
-    it('assigns sequential token numbers within the chosen mini-window', async () => {
+    it('books the exact requested slot when it is free', async () => {
       recurringRepository.findOne.mockResolvedValue(waveAvailability);
-      appointmentRepository.findOne.mockResolvedValue(null); // not already booked by this patient
-      appointmentRepository.count.mockResolvedValue(2); // 2 already booked in this wave
+      appointmentRepository.findOne.mockResolvedValue(null); // no duplicate
 
       const result = await service.create(1, {
         doctorId: 1,
         appointmentDate: FUTURE_DATE,
         recurringAvailabilityId: 20,
-        startTime: '10:30',
+        startTime: '10:31',
       });
 
-      expect(result.tokenNumber).toBe(3);
-      expect(result.startTime).toBe('10:30');
-      expect(result.endTime).toBe('11:00');
+      expect(result.tokenNumber).toBe(2);
+      expect(result.startTime).toBe('10:31');
+      expect(result.endTime).toBe('10:57');
+      expect(result.schedulingType).toBe(AvailabilityType.WAVE);
     });
 
-    it('rejects booking once that specific mini-window is at full capacity', async () => {
+    it('rejects booking once that specific slot is already taken', async () => {
       recurringRepository.findOne.mockResolvedValue(waveAvailability);
-      appointmentRepository.findOne.mockResolvedValue(null);
-      appointmentRepository.count.mockResolvedValue(4); // capacity reached
+      appointmentRepository.findOne.mockResolvedValue({ id: 55 }); // duplicate found
 
       await expect(
         service.create(1, {
@@ -238,24 +246,10 @@ describe('AppointmentService', () => {
           recurringAvailabilityId: 20,
           startTime: '10:00',
         }),
-      ).rejects.toThrow('Wave is full');
+      ).rejects.toThrow('This slot has already been booked');
     });
 
-    it('rejects a duplicate booking by the same patient in the same mini-window', async () => {
-      recurringRepository.findOne.mockResolvedValue(waveAvailability);
-      appointmentRepository.findOne.mockResolvedValue({ id: 55 }); // already booked
-
-      await expect(
-        service.create(1, {
-          doctorId: 1,
-          appointmentDate: FUTURE_DATE,
-          recurringAvailabilityId: 20,
-          startTime: '11:00',
-        }),
-      ).rejects.toThrow('You have already booked a slot in this wave');
-    });
-
-    it('rejects a start time that does not match any generated mini-window', async () => {
+    it('rejects a start time that does not match any generated slot', async () => {
       recurringRepository.findOne.mockResolvedValue(waveAvailability);
 
       await expect(

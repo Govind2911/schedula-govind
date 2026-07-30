@@ -121,48 +121,67 @@ describe('DoctorService', () => {
   });
 
   // ==========================================
-  // WAVE: duration is entered directly (mini-window size)
+  // WAVE: capacity + buffer -> derived per-patient duration
+  // (same "split the whole session across capacity" model as STREAM,
+  // but floored instead of requiring an exact integer split)
   // ==========================================
-  describe('Wave availability (duration entered directly)', () => {
-    it('accepts the entered duration as the mini-window size', async () => {
+  describe('Wave availability (capacity -> derived duration)', () => {
+    it('derives a 26-minute duration for a 2-hour window, capacity 4, 5-min buffer', async () => {
+      // 120 min window, (4-1)*5 = 15 min of buffers -> 105 usable minutes
+      // -> 105 / 4 = 26.25 -> floored to 26
       const result = await service.createRecurringAvailability(1, {
         dayOfWeek: 'Monday',
         type: AvailabilityType.WAVE,
         startTime: '10:00',
         endTime: '12:00',
-        duration: 30,
         capacity: 4,
+        bufferTime: 5,
       } as any);
 
-      expect(result.duration).toBe(30);
+      expect(result.duration).toBe(26);
       expect(result.capacity).toBe(4);
     });
 
-    it('rejects a missing duration for wave scheduling', async () => {
-      await expect(
-        service.createRecurringAvailability(1, {
-          dayOfWeek: 'Monday',
-          type: AvailabilityType.WAVE,
-          startTime: '10:00',
-          endTime: '12:00',
-          capacity: 4,
-        } as any),
-      ).rejects.toThrow('Invalid slot duration');
+    it('derives a 15-minute duration for a 2-hour window, capacity 6, 5-min buffer', async () => {
+      // 120 min window, (6-1)*5 = 25 min of buffers -> 95 usable minutes
+      // -> 95 / 6 ≈ 15.83 -> floored to 15
+      const result = await service.createRecurringAvailability(1, {
+        dayOfWeek: 'Monday',
+        type: AvailabilityType.WAVE,
+        startTime: '10:00',
+        endTime: '12:00',
+        capacity: 6,
+        bufferTime: 5,
+      } as any);
+
+      expect(result.duration).toBe(15);
     });
 
-    it('rejects a duration larger than the availability window', async () => {
+    it('ignores a manually supplied duration for wave scheduling', async () => {
+      const result = await service.createRecurringAvailability(1, {
+        dayOfWeek: 'Monday',
+        type: AvailabilityType.WAVE,
+        startTime: '10:00',
+        endTime: '12:00',
+        duration: 999, // should be ignored - derived instead
+        capacity: 4,
+        bufferTime: 5,
+      } as any);
+
+      expect(result.duration).toBe(26);
+    });
+
+    it('rejects a capacity/buffer combination that leaves no usable time', async () => {
       await expect(
         service.createRecurringAvailability(1, {
           dayOfWeek: 'Monday',
           type: AvailabilityType.WAVE,
           startTime: '10:00',
           endTime: '10:30',
-          duration: 45,
           capacity: 4,
+          bufferTime: 10,
         } as any),
-      ).rejects.toThrow(
-        'Slot duration and buffer time exceed the availability window',
-      );
+      ).rejects.toThrow(BadRequestException);
     });
   });
 

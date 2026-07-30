@@ -15,6 +15,7 @@ import { PatientProfile } from '../patient/patient-profile.entity';
 import { RecurringAvailability } from '../doctor/recurring-availability.entity';
 import { CustomAvailability } from '../doctor/custom-availability.entity';
 import { AvailabilityType } from '../doctor/enums/availability-type.enum';
+import { AppointmentStatus } from './enums/appointment-status.enum';
 
 @Injectable()
 export class AppointmentService {
@@ -68,17 +69,6 @@ export class AppointmentService {
     return new Date().toISOString().slice(0, 10);
   }
 
-  // ==========================================
-  // WINDOW SUBDIVISION (shared by STREAM & WAVE)
-  // ==========================================
-  //
-  // STREAM: `duration` here is the DERIVED per-patient duration (window
-  // evenly split across capacity) - each generated window is a single
-  // patient's exact appointment.
-  //
-  // WAVE: `duration` here is the mini-window size the doctor entered
-  // directly - each generated window is a shared wave, capacity patients
-  // can book into it, and get a token number based on order.
   private generateWindows(
     startTime: string,
     endTime: string,
@@ -176,55 +166,34 @@ export class AppointmentService {
         return this.timeToMinutes(w.startTime) > this.nowMinutes();
       });
 
-      if (entry.type === AvailabilityType.STREAM) {
-        // Each window is exactly one patient's exact appointment slot.
-        const slots = futureWindows.map((slot) => {
-          const isBooked = bookedAppointments.some(
-            (appt) =>
-              appt.startTime === slot.startTime && appt.status === 'BOOKED',
-          );
-
-          return {
-            startTime: slot.startTime,
-            endTime: slot.endTime,
-            status: isBooked ? 'BOOKED' : 'AVAILABLE',
-          };
-        });
-
-        return {
-          availabilityId: entry.id,
-          schedulingType: AvailabilityType.STREAM,
-          slots,
-        };
-      }
-
-      // WAVE - each window is a shared mini-window (wave) with its own
-      // capacity and token count.
-      const windows = futureWindows.map((w) => {
-        const bookedCount = bookedAppointments.filter(
+      // STREAM and WAVE both generate one-patient-per-slot windows. The
+      // per-patient slot length (entry.duration) is derived at
+      // availability-creation time by splitting the whole session evenly
+      // across `capacity`, accounting for `bufferTime` between
+      // consecutive patients - that's true for both types, so the same
+      // window generation and slot mapping applies to both.
+      const slots = futureWindows.map((slot) => {
+        const isBooked = bookedAppointments.some(
           (appt) =>
-            appt.startTime === w.startTime &&
-            appt.endTime === w.endTime &&
-            appt.status === 'BOOKED',
-        ).length;
-
-        const available = Math.max(entry.capacity - bookedCount, 0);
+       appt.startTime.substring(0, 5) === slot.startTime &&
+    appt.endTime.substring(0, 5) === slot.endTime &&
+    appt.status === AppointmentStatus.BOOKED,
+);
 
         return {
-          timeWindow: `${w.startTime} - ${w.endTime}`,
-          startTime: w.startTime,
-          endTime: w.endTime,
-          capacity: entry.capacity,
-          booked: bookedCount,
-          available,
-          isFull: available === 0,
+          startTime: slot.startTime,
+          endTime: slot.endTime,
+          status: isBooked ? AppointmentStatus.BOOKED : AppointmentStatus.AVAILABLE,
         };
       });
 
       return {
         availabilityId: entry.id,
-        schedulingType: AvailabilityType.WAVE,
-        windows,
+        schedulingType: entry.type,
+        capacity: entry.capacity,
+        slotDurationMinutes: entry.duration,
+        bufferTime: entry.bufferTime ?? 0,
+        slots,
       };
     });
 
@@ -352,9 +321,12 @@ export class AppointmentService {
       );
     }
 
-    // Both STREAM and WAVE now generate discrete windows from the same
-    // availability row - STREAM windows are 1-patient exact slots, WAVE
-    // windows are shared mini-windows with their own capacity.
+    // STREAM and WAVE both generate discrete one-patient-per-slot windows
+    // from the same availability row. For WAVE, `source.duration` is the
+    // per-patient duration already derived (at availability-creation
+    // time) from splitting the whole session evenly across `capacity`,
+    // accounting for `bufferTime` between consecutive patients - so the
+    // same window generation applies to both types.
     const windows = this.generateWindows(
       source.startTime,
       source.endTime,
@@ -362,9 +334,10 @@ export class AppointmentService {
       source.bufferTime ?? 0,
     );
 
-    const matchedWindow = windows.find(
+    const slotIndex = windows.findIndex(
       (w) => w.startTime === createAppointmentDto.startTime,
     );
+    const matchedWindow = slotIndex === -1 ? undefined : windows[slotIndex];
 
     if (!matchedWindow) {
       throw new BadRequestException(
@@ -380,79 +353,26 @@ export class AppointmentService {
     }
 
     // ==========================================
-    // STREAM BOOKING - exactly one patient per window
+    // BOOKING - exactly one patient per generated slot, for both STREAM
+    // and WAVE. Also enforced at the DB level by the unique constraint
+    // on (doctor, appointmentDate, startTime, endTime).
     // ==========================================
-    if (schedulingType === AvailabilityType.STREAM) {
-      const duplicate = await this.appointmentRepository.findOne({
-        where: {
-          doctor: { id: doctor.id },
-          appointmentDate: createAppointmentDto.appointmentDate,
-          startTime: matchedWindow.startTime,
-          status: 'BOOKED',
-        },
-        relations: { doctor: true },
-      });
-
-      if (duplicate) {
-        throw new BadRequestException('Slot already booked');
-      }
-
-      const appointment = this.appointmentRepository.create({
-        doctor,
-        patient,
-        recurringAvailability: recurringAvailability ?? undefined,
-        customAvailability: customAvailability ?? undefined,
-        appointmentDate: createAppointmentDto.appointmentDate,
-        schedulingType,
-        startTime: matchedWindow.startTime,
-        endTime: matchedWindow.endTime,
-        status: 'BOOKED',
-      });
-
-      return await this.appointmentRepository.save(appointment);
-    }
-
-    // ==========================================
-    // WAVE BOOKING - up to `capacity` patients per mini-window, token
-    // assigned by booking order within that specific mini-window.
-    // ==========================================
-    const alreadyBookedByPatient = await this.appointmentRepository.findOne({
-      where: {
-        doctor: { id: doctor.id },
-        patient: { id: patient.id },
-        appointmentDate: createAppointmentDto.appointmentDate,
-        startTime: matchedWindow.startTime,
-        endTime: matchedWindow.endTime,
-        status: 'BOOKED',
-      },
-      relations: { doctor: true, patient: true },
-    });
-
-    if (alreadyBookedByPatient) {
-      throw new BadRequestException(
-        'You have already booked a slot in this wave',
-      );
-    }
-
-    const existingAppointments = await this.appointmentRepository.count({
+    const duplicate = await this.appointmentRepository.findOne({
       where: {
         doctor: { id: doctor.id },
         appointmentDate: createAppointmentDto.appointmentDate,
         startTime: matchedWindow.startTime,
-        endTime: matchedWindow.endTime,
-        status: 'BOOKED',
+        status: AppointmentStatus.BOOKED,
       },
       relations: { doctor: true },
     });
 
-    const capacity = source.capacity;
-
-    if (!capacity || capacity < 1) {
-      throw new BadRequestException('Invalid capacity configuration');
-    }
-
-    if (existingAppointments >= capacity) {
-      throw new BadRequestException('Wave is full');
+    if (duplicate) {
+      throw new BadRequestException(
+        schedulingType === AvailabilityType.WAVE
+          ? 'This slot has already been booked'
+          : 'Slot already booked',
+      );
     }
 
     const appointment = this.appointmentRepository.create({
@@ -464,11 +384,16 @@ export class AppointmentService {
       schedulingType,
       startTime: matchedWindow.startTime,
       endTime: matchedWindow.endTime,
-      tokenNumber: existingAppointments + 1,
-      status: 'BOOKED',
+      tokenNumber: slotIndex + 1,
+      status: AppointmentStatus.BOOKED,
     });
 
-    return await this.appointmentRepository.save(appointment);
+    const saved = await this.appointmentRepository.save(appointment);
+
+    return {
+      message: 'Appointment booked successfully',
+      appointment: saved,
+    };
   }
 
   async getDoctorAvailability(doctorId: number, date: string) {
@@ -546,4 +471,115 @@ export class AppointmentService {
       message: 'Appointment deleted successfully',
     };
   }
+  async getMyAppointments(userId: number) {
+  const patient = await this.patientRepository.findOne({
+    where: {
+      user: {
+        id: userId,
+      },
+    },
+    relations: {
+      user: true,
+    },
+  });
+
+  if (!patient) {
+    throw new NotFoundException(
+      'Patient profile not found',
+    );
+  }
+
+  const appointments =
+    await this.appointmentRepository.find({
+      where: {
+        patient: {
+          id: patient.id,
+        },
+      },
+      relations: {
+        doctor: true,
+      },
+      order: {
+        appointmentDate: 'ASC',
+      },
+    });
+
+  if (!appointments.length) {
+    throw new NotFoundException(
+      'No appointments found',
+    );
+  }
+
+  return appointments;
+}
+
+async cancelAppointment(
+  appointmentId: number,
+  userId: number,
+) {
+  const patient = await this.patientRepository.findOne({
+    where: {
+      user: {
+        id: userId,
+      },
+    },
+  });
+
+  if (!patient) {
+    throw new NotFoundException(
+      'Patient profile not found',
+    );
+  }
+
+  const appointment =
+    await this.appointmentRepository.findOne({
+      where: {
+        id: appointmentId,
+      },
+      relations: {
+        patient: true,
+      },
+    });
+
+  if (!appointment) {
+    throw new NotFoundException(
+      'Appointment not found',
+    );
+  }
+
+  if (
+    appointment.patient.id !== patient.id
+  ) {
+    throw new BadRequestException(
+      'Unauthorized access',
+    );
+  }
+
+  if (
+    appointment.status ===
+    AppointmentStatus.CANCELLED
+  ) {
+    throw new BadRequestException(
+      'Appointment already cancelled',
+    );
+  }
+
+  if (
+    this.isDateInPast(
+      appointment.appointmentDate,
+    )
+  ) {
+    throw new BadRequestException(
+      'Past appointment cannot be cancelled',
+    );
+  }
+
+  appointment.status =
+    AppointmentStatus.CANCELLED;
+
+  return await this.appointmentRepository.save(
+    appointment,
+  );
+}
+
 }
