@@ -25,6 +25,9 @@ export class AppointmentController {
     private readonly appointmentService: AppointmentService,
   ) {}
 
+  // -----------------------------
+  // BOOK APPOINTMENT
+  // -----------------------------
   @Post()
   @Roles(Role.PATIENT)
   create(
@@ -37,36 +40,72 @@ export class AppointmentController {
     );
   }
 
+  // -----------------------------
+  // PATIENT APPOINTMENTS
+  // -----------------------------
+  @Get('my')
+  @Roles(Role.PATIENT)
+  getMyAppointments(@Req() req) {
+    return this.appointmentService.getMyAppointments(
+      req.user.userId,
+    );
+  }
+
+  // -----------------------------
+  // CANCEL APPOINTMENT
+  // -----------------------------
+  @Patch(':id/cancel')
+  @Roles(Role.PATIENT)
+  cancelAppointment(
+    @Req() req,
+    @Param('id') id: string,
+  ) {
+    return this.appointmentService.cancelAppointment(
+      +id,
+      req.user.userId,
+    );
+  }
+
+  // -----------------------------
+  // ADMIN / DEBUG
+  // -----------------------------
   @Get()
   findAll() {
     return this.appointmentService.findAll();
   }
-  
-@Get('availability/:doctorId/:date')
-getAvailability(
-  @Param('doctorId') doctorId: string,
-  @Param('date') date: string,
-) {
-  return this.appointmentService.getDoctorAvailability(
-    +doctorId,
-    date,
-  );
-}
 
-// Patient-facing view: exact time slots for STREAM, grouped
-// window + Available x/y for WAVE.
-@Get('slots/:doctorId/:date')
-getSlots(
-  @Param('doctorId') doctorId: string,
-  @Param('date') date: string,
-) {
-  return this.appointmentService.getPatientAvailability(
-    +doctorId,
-    date,
-  );
-}
+  // -----------------------------
+  // SLOT APIs
+  // -----------------------------
+  @Get('availability/:doctorId/:date')
+  getAvailability(
+    @Param('doctorId') doctorId: string,
+    @Param('date') date: string,
+  ) {
+    return this.appointmentService.getDoctorAvailability(
+      +doctorId,
+      date,
+    );
+  }
+
+  @Get('slots/:doctorId/:date')
+  getSlots(
+    @Param('doctorId') doctorId: string,
+    @Param('date') date: string,
+  ) {
+    return this.appointmentService.getPatientAvailability(
+      +doctorId,
+      date,
+    );
+  }
+
+  // -----------------------------
+  // EXISTING CRUD
+  // -----------------------------
   @Get(':id')
-  findOne(@Param('id') id: string) {
+  findOne(
+    @Param('id') id: string,
+  ) {
     return this.appointmentService.findOne(+id);
   }
 
@@ -82,7 +121,9 @@ getSlots(
   }
 
   @Delete(':id')
-  remove(@Param('id') id: string) {
+  remove(
+    @Param('id') id: string,
+  ) {
     return this.appointmentService.remove(+id);
   }
 }

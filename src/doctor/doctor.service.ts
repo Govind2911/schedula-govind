@@ -16,6 +16,8 @@ import { CreateRecurringAvailabilityDto } from './dto/create-recurring-availabil
 import { UpdateRecurringAvailabilityDto } from './dto/update-recurring-availability.dto';
 import { CreateCustomAvailabilityDto } from './dto/create-custom-availability.dto';
 import { AvailabilityType } from './enums/availability-type.enum';
+import { Appointment } from '../appointment/entities/appointment.entity';
+import { AppointmentStatus } from '../appointment/enums/appointment-status.enum';
 
 @Injectable()
 export class DoctorService {
@@ -31,6 +33,9 @@ export class DoctorService {
 
     @InjectRepository(CustomAvailability)
     private readonly customAvailabilityRepository: Repository<CustomAvailability>,
+
+    @InjectRepository(Appointment)
+    private readonly appointmentRepository: Repository<Appointment>,
   ) {}
 
   async createProfile(
@@ -377,6 +382,9 @@ private resolveAvailabilityConfig(dto: {
   type: AvailabilityType;
   startTime: string;
   endTime: string;
+  // Accepted for backwards compatibility but ignored: the per-patient
+  // slot length is always derived from capacity/bufferTime/window for
+  // both STREAM and WAVE.
   duration?: number;
   bufferTime?: number;
   capacity: number;
@@ -410,19 +418,33 @@ private resolveAvailabilityConfig(dto: {
   }
 
   // WAVE
-  if (!dto.duration || dto.duration <= 0) {
-    throw new BadRequestException('Invalid slot duration');
-  }
+  //
+  // WAVE no longer takes a doctor-entered mini-window duration. `capacity`
+  // is the total number of patients across the *entire* session, and the
+  // per-patient slot length is derived the same way STREAM derives it -
+  // by dividing the usable time (session length minus the buffers between
+  // consecutive patients) evenly across `capacity`. Unlike STREAM, WAVE
+  // does not require an exact integer split: the result is floored to the
+  // nearest whole minute, leaving at most a few seconds/minutes of slack
+  // at the end of the session rather than rejecting the configuration.
+  const totalBuffer = bufferTime * (dto.capacity - 1);
+  const usableMinutes = windowMinutes - totalBuffer;
 
-  const step = dto.duration + bufferTime;
-
-  if (step > windowMinutes) {
+  if (usableMinutes <= 0) {
     throw new BadRequestException(
-      'Slot duration and buffer time exceed the availability window',
+      'Invalid configuration: buffer time and capacity leave no usable time in the availability window',
     );
   }
 
-  return dto.duration;
+  const derivedDuration = Math.floor(usableMinutes / dto.capacity);
+
+  if (derivedDuration <= 0) {
+    throw new BadRequestException(
+      'Invalid slot duration: capacity does not fit within the availability window for wave scheduling. Adjust capacity, buffer time, or the window.',
+    );
+  }
+
+  return derivedDuration;
 }
 
 async getAvailabilityByDate(
@@ -473,5 +495,56 @@ async getAvailabilityByDate(
     },
   });
 }
+async getAppointments(userId: number) {
+  const doctor = await this.doctorRepository.findOne({
+    where: {
+      user: {
+        id: userId,
+      },
+    },
+    relations: {
+      user: true,
+    },
+  });
 
+  if (!doctor) {
+    throw new NotFoundException(
+      'Doctor profile not found',
+    );
+  }
+
+  const appointments =
+    await this.appointmentRepository.find({
+      where: {
+        doctor: {
+          id: doctor.id,
+        },
+      },
+      relations: {
+        patient: true,
+      },
+      order: {
+        appointmentDate: 'ASC',
+        startTime: 'ASC',
+      },
+    });
+
+  if (!appointments.length) {
+    throw new NotFoundException(
+      'No appointments found',
+    );
+  }
+
+  return appointments.map((appointment) => ({
+    id: appointment.id,
+    patient: appointment.patient,
+    appointmentDate:
+      appointment.appointmentDate,
+    startTime: appointment.startTime,
+    endTime: appointment.endTime,
+    tokenNumber:
+      appointment.tokenNumber,
+    status: appointment.status,
+  }));
+}
 }
