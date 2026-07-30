@@ -175,8 +175,10 @@ export class AppointmentService {
       const slots = futureWindows.map((slot) => {
         const isBooked = bookedAppointments.some(
           (appt) =>
-            appt.startTime === slot.startTime && appt.status === AppointmentStatus.BOOKED,
-        );
+       appt.startTime.substring(0, 5) === slot.startTime &&
+    appt.endTime.substring(0, 5) === slot.endTime &&
+    appt.status === AppointmentStatus.BOOKED,
+);
 
         return {
           startTime: slot.startTime,
