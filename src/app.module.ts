@@ -9,19 +9,24 @@ import { PatientModule } from './patient/patient.module';
 import { RecurringAvailability} from './doctor/recurring-availability.entity';
 import { CustomAvailability } from './doctor/custom-availability.entity';
 import { AppointmentModule } from './appointment/appointment.module';
+import { ConfigModule } from '@nestjs/config';
 @Module({
   imports: [
- TypeOrmModule.forRoot({
-      type: 'postgres',
-      host: 'localhost',
-      port: 5432,
-      username: 'postgres',
-      password: 'root123',
-      database: 'schedula',
+  ConfigModule.forRoot({
+    isGlobal: true,
+  }),
 
-      autoLoadEntities: true,
-      synchronize: false,
-    }),
+  TypeOrmModule.forRoot({
+    type: 'postgres',
+    host: process.env.DB_HOST,
+    port: parseInt(process.env.DB_PORT || '5432'),
+    username: process.env.DB_USERNAME,
+    password: process.env.DB_PASSWORD,
+    database: process.env.DB_NAME,
+
+    autoLoadEntities: true,
+    synchronize: false,
+  }),
  UsersModule,
  AuthModule,
  DoctorModule,

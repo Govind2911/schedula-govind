@@ -7,14 +7,22 @@ import { JwtStrategy } from './jwt.strategy/jwt.strategy';
 import { Roles } from './roles/roles.decorator';
 import { RolesGuard } from './roles/roles.guard';
 
+import { ConfigModule, ConfigService } from '@nestjs/config';
+
 @Module({
   imports: [
     UsersModule,
-    JwtModule.register({
-      secret: 'schedula-secret-key',
-      signOptions: {
-        expiresIn: '1d',
-      },
+    ConfigModule,
+
+    JwtModule.registerAsync({
+      imports: [ConfigModule],
+      inject: [ConfigService],
+      useFactory: (configService: ConfigService) => ({
+        secret: configService.get<string>('JWT_SECRET'),
+        signOptions: {
+          expiresIn: '1d',
+        },
+      }),
     }),
   ],
   controllers: [AuthController],
