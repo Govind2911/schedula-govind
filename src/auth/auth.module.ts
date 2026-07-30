@@ -8,6 +8,7 @@ import { UsersModule } from '../users/users.module';
 import { JwtStrategy } from './jwt.strategy/jwt.strategy';
 import { RolesGuard } from './roles/roles.guard';
 
+
 @Module({
   imports: [
     UsersModule,
@@ -16,12 +17,13 @@ import { RolesGuard } from './roles/roles.guard';
     JwtModule.registerAsync({
       imports: [ConfigModule],
       inject: [ConfigService],
-      useFactory: (config: ConfigService) => ({
-        secret: config.get<string>('JWT_SECRET'),
-        signOptions: {
-          expiresIn: '1d',
-        },
-      }),
+
+    useFactory: (config: ConfigService) => ({
+  secret: config.get<string>('JWT_SECRET'),
+  signOptions: {
+    expiresIn: '1d',
+  },
+}),
     }),
   ],
 
