@@ -1,6 +1,7 @@
 import { Test, TestingModule } from '@nestjs/testing';
 import { getRepositoryToken } from '@nestjs/typeorm';
 import { BadRequestException, NotFoundException } from '@nestjs/common';
+import { DataSource } from 'typeorm';
 
 import { AppointmentService } from './appointment.service';
 import { Appointment } from './entities/appointment.entity';
@@ -9,6 +10,7 @@ import { PatientProfile } from '../patient/patient-profile.entity';
 import { RecurringAvailability } from '../doctor/recurring-availability.entity';
 import { CustomAvailability } from '../doctor/custom-availability.entity';
 import { AvailabilityType } from '../doctor/enums/availability-type.enum';
+import { AppointmentStatus } from './enums/appointment-status.enum';
 
 // Far-future date so "is this in the past?" checks never trigger flakiness.
 const FUTURE_DATE = '2099-06-15';
@@ -25,6 +27,23 @@ const mockRepo = () => ({
   save: jest.fn((x) => Promise.resolve({ id: 1, ...x })),
 });
 
+// Mock query runner used by rescheduleAppointment's transaction. Each
+// test wires manager.findOne to whatever it needs (patient/appointment
+// lookups and the conflict check all go through this one mock).
+const mockManager = () => ({
+  findOne: jest.fn(),
+  save: jest.fn((x) => Promise.resolve(x)),
+});
+
+const mockQueryRunner = () => ({
+  connect: jest.fn(),
+  startTransaction: jest.fn(),
+  commitTransaction: jest.fn(),
+  rollbackTransaction: jest.fn(),
+  release: jest.fn(),
+  manager: mockManager(),
+});
+
 describe('AppointmentService', () => {
   let service: AppointmentService;
   let appointmentRepository: ReturnType<typeof mockRepo>;
@@ -32,11 +51,17 @@ describe('AppointmentService', () => {
   let patientRepository: ReturnType<typeof mockRepo>;
   let recurringRepository: ReturnType<typeof mockRepo>;
   let customRepository: ReturnType<typeof mockRepo>;
+  let queryRunner: ReturnType<typeof mockQueryRunner>;
 
   const doctor: Partial<DoctorProfile> = { id: 1, fullName: 'Dr. Rao' } as any;
   const patient: Partial<PatientProfile> = { id: 1, fullName: 'John' } as any;
 
   beforeEach(async () => {
+    queryRunner = mockQueryRunner();
+    const dataSource = {
+      createQueryRunner: jest.fn(() => queryRunner),
+    };
+
     const module: TestingModule = await Test.createTestingModule({
       providers: [
         AppointmentService,
@@ -51,6 +76,7 @@ describe('AppointmentService', () => {
           provide: getRepositoryToken(CustomAvailability),
           useFactory: mockRepo,
         },
+        { provide: DataSource, useValue: dataSource },
       ],
     }).compile();
 
@@ -98,9 +124,9 @@ describe('AppointmentService', () => {
         startTime: '10:40',
       });
 
-      expect(result.startTime).toBe('10:40');
-      expect(result.endTime).toBe('11:00');
-      expect(result.schedulingType).toBe(AvailabilityType.STREAM);
+      expect(result.appointment.startTime).toBe('10:40');
+      expect(result.appointment.endTime).toBe('11:00');
+      expect(result.appointment.schedulingType).toBe(AvailabilityType.STREAM);
     });
 
     it('rejects a start time that does not align with the generated grid', async () => {
@@ -229,10 +255,10 @@ describe('AppointmentService', () => {
         startTime: '10:31',
       });
 
-      expect(result.tokenNumber).toBe(2);
-      expect(result.startTime).toBe('10:31');
-      expect(result.endTime).toBe('10:57');
-      expect(result.schedulingType).toBe(AvailabilityType.WAVE);
+      expect(result.appointment.tokenNumber).toBe(2);
+      expect(result.appointment.startTime).toBe('10:31');
+      expect(result.appointment.endTime).toBe('10:57');
+      expect(result.appointment.schedulingType).toBe(AvailabilityType.WAVE);
     });
 
     it('rejects booking once that specific slot is already taken', async () => {
@@ -352,6 +378,312 @@ describe('AppointmentService', () => {
 
       expect(result.sessions).toEqual([]);
       expect(result.message).toBe('No availability configured for this date');
+    });
+  });
+
+  // ==========================================
+  // CANCEL APPOINTMENT (incl. 30-minute cutoff)
+  // ==========================================
+  describe('Cancel appointment', () => {
+    it('cancels an appointment safely outside the cutoff window', async () => {
+      const appointment = {
+        id: 100,
+        status: AppointmentStatus.BOOKED,
+        appointmentDate: FUTURE_DATE,
+        startTime: '10:00:00',
+        patient: { id: 1 },
+      };
+      appointmentRepository.findOne.mockResolvedValue(appointment);
+      appointmentRepository.save.mockImplementation((x) => Promise.resolve(x));
+
+      const result = await service.cancelAppointment(100, 1);
+
+      expect(result.status).toBe(AppointmentStatus.CANCELLED);
+    });
+
+    it('rejects cancelling within the 30-minute cutoff', async () => {
+      const soon = new Date(Date.now() + 10 * 60000);
+      const soonDate = soon.toISOString().slice(0, 10);
+      const soonTime = `${String(soon.getHours()).padStart(2, '0')}:${String(
+        soon.getMinutes(),
+      ).padStart(2, '0')}:00`;
+
+      appointmentRepository.findOne.mockResolvedValue({
+        id: 101,
+        status: AppointmentStatus.BOOKED,
+        appointmentDate: soonDate,
+        startTime: soonTime,
+        patient: { id: 1 },
+      });
+
+      await expect(service.cancelAppointment(101, 1)).rejects.toThrow(
+        'at least 30 minutes',
+      );
+    });
+
+    it('rejects cancelling someone else\'s appointment', async () => {
+      appointmentRepository.findOne.mockResolvedValue({
+        id: 102,
+        status: AppointmentStatus.BOOKED,
+        appointmentDate: FUTURE_DATE,
+        startTime: '10:00:00',
+        patient: { id: 999 },
+      });
+
+      await expect(service.cancelAppointment(102, 1)).rejects.toThrow(
+        'Unauthorized access',
+      );
+    });
+
+    it('rejects cancelling an already-cancelled appointment', async () => {
+      appointmentRepository.findOne.mockResolvedValue({
+        id: 103,
+        status: AppointmentStatus.CANCELLED,
+        appointmentDate: FUTURE_DATE,
+        startTime: '10:00:00',
+        patient: { id: 1 },
+      });
+
+      await expect(service.cancelAppointment(103, 1)).rejects.toThrow(
+        'Appointment already cancelled',
+      );
+    });
+  });
+
+  // ==========================================
+  // RESCHEDULE APPOINTMENT
+  // ==========================================
+  describe('Reschedule appointment', () => {
+    const streamAvailability = {
+      id: 10,
+      type: AvailabilityType.STREAM,
+      dayOfWeek: FUTURE_DAY_OF_WEEK,
+      startTime: '10:00',
+      endTime: '12:00',
+      duration: 20,
+      bufferTime: 0,
+      capacity: 6,
+      doctorProfile: doctor,
+    };
+
+    const waveAvailability = {
+      id: 20,
+      type: AvailabilityType.WAVE,
+      dayOfWeek: FUTURE_DAY_OF_WEEK,
+      startTime: '10:00',
+      endTime: '12:00',
+      duration: 26,
+      bufferTime: 5,
+      capacity: 4,
+      doctorProfile: doctor,
+    };
+
+    const existingStreamAppointment = {
+      id: 100,
+      status: AppointmentStatus.BOOKED,
+      appointmentDate: FUTURE_DATE,
+      startTime: '10:00:00',
+      endTime: '10:20:00',
+      tokenNumber: 1,
+      schedulingType: AvailabilityType.STREAM,
+      doctor: { id: 1 },
+      patient: { id: 1 },
+      recurringAvailability: { id: 10 },
+      customAvailability: null,
+    };
+
+    it('reschedules to a free slot on the same availability', async () => {
+      queryRunner.manager.findOne
+        .mockResolvedValueOnce(patient) // patient lookup
+        .mockResolvedValueOnce(existingStreamAppointment) // appointment lookup
+        .mockResolvedValueOnce(streamAvailability) // target availability
+        .mockResolvedValueOnce(null); // conflict check - free
+
+      const result = await service.rescheduleAppointment(100, 1, {
+        appointmentDate: FUTURE_DATE,
+        startTime: '11:00',
+      });
+
+      expect(result.message).toBe('Appointment rescheduled successfully');
+      expect(result.appointment.startTime).toBe('11:00');
+      expect(result.appointment.endTime).toBe('11:20');
+      expect(result.appointment.tokenNumber).toBe(4);
+      expect(queryRunner.commitTransaction).toHaveBeenCalled();
+    });
+
+    it('prevents rescheduling to the exact same slot', async () => {
+      queryRunner.manager.findOne
+        .mockResolvedValueOnce(patient)
+        .mockResolvedValueOnce(existingStreamAppointment)
+        .mockResolvedValueOnce(streamAvailability);
+
+      await expect(
+        service.rescheduleAppointment(100, 1, {
+          appointmentDate: FUTURE_DATE,
+          startTime: '10:00',
+        }),
+      ).rejects.toThrow('New slot is the same as the current appointment');
+    });
+
+    it('rejects a start time that does not align with the generated grid', async () => {
+      queryRunner.manager.findOne
+        .mockResolvedValueOnce(patient)
+        .mockResolvedValueOnce(existingStreamAppointment)
+        .mockResolvedValueOnce(streamAvailability);
+
+      await expect(
+        service.rescheduleAppointment(100, 1, {
+          appointmentDate: FUTURE_DATE,
+          startTime: '10:07',
+        }),
+      ).rejects.toThrow('Requested slot does not exist for this availability');
+    });
+
+    it('rejects rescheduling someone else\'s appointment', async () => {
+      queryRunner.manager.findOne
+        .mockResolvedValueOnce(patient)
+        .mockResolvedValueOnce({
+          ...existingStreamAppointment,
+          patient: { id: 999 },
+        });
+
+      await expect(
+        service.rescheduleAppointment(100, 1, {
+          appointmentDate: FUTURE_DATE,
+          startTime: '11:00',
+        }),
+      ).rejects.toThrow('Unauthorized access');
+    });
+
+    it('rejects rescheduling a cancelled appointment', async () => {
+      queryRunner.manager.findOne
+        .mockResolvedValueOnce(patient)
+        .mockResolvedValueOnce({
+          ...existingStreamAppointment,
+          status: AppointmentStatus.CANCELLED,
+        });
+
+      await expect(
+        service.rescheduleAppointment(100, 1, {
+          appointmentDate: FUTURE_DATE,
+          startTime: '11:00',
+        }),
+      ).rejects.toThrow('Cannot reschedule a cancelled appointment');
+    });
+
+    it('enforces the 30-minute cutoff on the slot being given up', async () => {
+      const soon = new Date(Date.now() + 10 * 60000);
+      const soonDate = soon.toISOString().slice(0, 10);
+      const soonTime = `${String(soon.getHours()).padStart(2, '0')}:${String(
+        soon.getMinutes(),
+      ).padStart(2, '0')}:00`;
+
+      queryRunner.manager.findOne
+        .mockResolvedValueOnce(patient)
+        .mockResolvedValueOnce({
+          ...existingStreamAppointment,
+          appointmentDate: soonDate,
+          startTime: soonTime,
+        });
+
+      await expect(
+        service.rescheduleAppointment(100, 1, {
+          appointmentDate: FUTURE_DATE,
+          startTime: '11:00',
+        }),
+      ).rejects.toThrow('at least 30 minutes');
+    });
+
+    it('rejects an invalid appointment id without touching the transaction', async () => {
+      await expect(
+        service.rescheduleAppointment(0, 1, {
+          appointmentDate: FUTURE_DATE,
+          startTime: '11:00',
+        }),
+      ).rejects.toThrow('Invalid appointment id');
+
+      expect(queryRunner.connect).not.toHaveBeenCalled();
+    });
+
+    it('throws NotFoundException when the appointment does not exist', async () => {
+      queryRunner.manager.findOne
+        .mockResolvedValueOnce(patient)
+        .mockResolvedValueOnce(null);
+
+      await expect(
+        service.rescheduleAppointment(999, 1, {
+          appointmentDate: FUTURE_DATE,
+          startTime: '11:00',
+        }),
+      ).rejects.toThrow(NotFoundException);
+
+      expect(queryRunner.rollbackTransaction).toHaveBeenCalled();
+    });
+
+    it('suggests the next available slot when the requested one is already booked', async () => {
+      queryRunner.manager.findOne
+        .mockResolvedValueOnce(patient)
+        .mockResolvedValueOnce(existingStreamAppointment)
+        .mockResolvedValueOnce(streamAvailability)
+        .mockResolvedValueOnce({ id: 999 }); // conflict - already booked
+
+      customRepository.find.mockResolvedValue([]);
+      recurringRepository.find.mockResolvedValue([streamAvailability]);
+      appointmentRepository.find.mockResolvedValue([
+        { id: 999, startTime: '10:20', endTime: '10:40', status: 'BOOKED' },
+      ]);
+
+      try {
+        await service.rescheduleAppointment(100, 1, {
+          appointmentDate: FUTURE_DATE,
+          startTime: '10:20',
+        });
+        throw new Error('expected rescheduleAppointment to throw');
+      } catch (error) {
+        expect(error).toBeInstanceOf(BadRequestException);
+        const response = (error as BadRequestException).getResponse() as {
+          message: string;
+          suggestedSlot: { startTime: string; endTime: string } | null;
+        };
+        expect(response.message).toBe('This slot has already been booked');
+        expect(response.suggestedSlot?.startTime).toBe('10:40');
+      }
+
+      expect(queryRunner.rollbackTransaction).toHaveBeenCalled();
+    });
+
+    it('uses "wave" wording when a WAVE availability is full', async () => {
+      const existingWaveAppointment = {
+        ...existingStreamAppointment,
+        schedulingType: AvailabilityType.WAVE,
+        recurringAvailability: { id: 20 },
+      };
+
+      queryRunner.manager.findOne
+        .mockResolvedValueOnce(patient)
+        .mockResolvedValueOnce(existingWaveAppointment)
+        .mockResolvedValueOnce(waveAvailability)
+        .mockResolvedValueOnce({ id: 888 }); // conflict - wave slot full
+
+      customRepository.find.mockResolvedValue([]);
+      recurringRepository.find.mockResolvedValue([waveAvailability]);
+      appointmentRepository.find.mockResolvedValue([
+        { id: 888, startTime: '10:31', endTime: '10:57', status: 'BOOKED' },
+      ]);
+
+      try {
+        await service.rescheduleAppointment(100, 1, {
+          appointmentDate: FUTURE_DATE,
+          startTime: '10:31',
+        });
+        throw new Error('expected rescheduleAppointment to throw');
+      } catch (error) {
+        expect(error).toBeInstanceOf(BadRequestException);
+        const response = (error as BadRequestException).getResponse() as {
+          message: string;
+        };
+        expect(response.message).toBe('This wave is already full');
+      }
     });
   });
 });

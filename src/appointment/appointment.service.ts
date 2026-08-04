@@ -3,12 +3,13 @@ import {
   BadRequestException,
   NotFoundException,
 } from '@nestjs/common';
-import { InjectRepository } from '@nestjs/typeorm';
-import { Repository } from 'typeorm';
+import { InjectRepository, InjectDataSource } from '@nestjs/typeorm';
+import { DataSource, Repository } from 'typeorm';
 
 import { Appointment } from './entities/appointment.entity';
 import { CreateAppointmentDto } from './dto/create-appointment.dto';
 import { UpdateAppointmentDto } from './dto/update-appointment.dto';
+import { RescheduleAppointmentDto } from './dto/reschedule-appointment.dto';
 
 import { DoctorProfile } from '../doctor/doctor-profile.entity';
 import { PatientProfile } from '../patient/patient-profile.entity';
@@ -34,7 +35,18 @@ export class AppointmentService {
 
     @InjectRepository(CustomAvailability)
     private readonly customRepository: Repository<CustomAvailability>,
+
+    @InjectDataSource()
+    private readonly dataSource: DataSource,
   ) {}
+
+  // Appointments cannot be rescheduled or cancelled within this many
+  // minutes of their scheduled start time.
+  private readonly CUTOFF_MINUTES = 30;
+
+  // How many calendar days ahead to search when suggesting a replacement
+  // slot for an unavailable reschedule target.
+  private readonly SUGGESTION_SEARCH_DAYS = 14;
 
   private getDayOfWeek(date: string): string {
     return new Date(`${date}T00:00:00`).toLocaleDateString('en-US', {
@@ -67,6 +79,131 @@ export class AppointmentService {
 
   private todayIso(): string {
     return new Date().toISOString().slice(0, 10);
+  }
+
+  private minutesUntil(date: string, time: string): number {
+    const target = new Date(`${date}T${time.substring(0, 5)}:00`);
+    return (target.getTime() - Date.now()) / 60000;
+  }
+
+  // Shared 30-minute cutoff rule for both reschedule and cancel. Throws
+  // if the appointment being acted on has already passed, or starts too
+  // soon to safely modify.
+  private assertOutsideCutoff(
+    date: string,
+    time: string,
+    action: 'reschedule' | 'cancel',
+  ): void {
+    const minutesUntil = this.minutesUntil(date, time);
+
+    if (minutesUntil < 0) {
+      throw new BadRequestException(
+        `Cannot ${action} a past appointment`,
+      );
+    }
+
+    if (minutesUntil < this.CUTOFF_MINUTES) {
+      throw new BadRequestException(
+        `Appointments can only be ${action}d at least ${this.CUTOFF_MINUTES} minutes before the scheduled time`,
+      );
+    }
+  }
+
+  // Scans forward from (fromDate, fromTime) across this doctor's
+  // availability (custom overriding recurring, same rule as patient
+  // availability lookup) to find the next free slot. Used to offer an
+  // alternative instead of a bare error when the requested reschedule
+  // target is unavailable.
+  private async findNextAvailableSlot(
+    doctorId: number,
+    fromDate: string,
+    fromTime: string,
+    excludeAppointmentId?: number,
+  ): Promise<{
+    appointmentDate: string;
+    startTime: string;
+    endTime: string;
+    schedulingType: AvailabilityType;
+    recurringAvailabilityId?: number;
+    customAvailabilityId?: number;
+  } | null> {
+    let cursorDate = fromDate;
+
+    for (
+      let dayOffset = 0;
+      dayOffset < this.SUGGESTION_SEARCH_DAYS;
+      dayOffset++
+    ) {
+      const dayOfWeek = this.getDayOfWeek(cursorDate);
+      const isFirstDay = dayOffset === 0;
+      const isToday = cursorDate === this.todayIso();
+
+      const customEntries = await this.customRepository.find({
+        where: { doctorProfile: { id: doctorId }, date: cursorDate },
+        relations: { doctorProfile: true },
+      });
+
+      const sourceEntries: Array<RecurringAvailability | CustomAvailability> =
+        customEntries.length > 0
+          ? customEntries
+          : await this.recurringRepository.find({
+              where: { doctorProfile: { id: doctorId }, dayOfWeek },
+              relations: { doctorProfile: true },
+            });
+
+      const bookedAppointments = await this.appointmentRepository.find({
+        where: {
+          doctor: { id: doctorId },
+          appointmentDate: cursorDate,
+          status: AppointmentStatus.BOOKED,
+        },
+      });
+
+      for (const entry of sourceEntries) {
+        const windows = this.generateWindows(
+          entry.startTime,
+          entry.endTime,
+          entry.duration,
+          entry.bufferTime ?? 0,
+        );
+
+        for (const window of windows) {
+          if (isFirstDay && this.timeToMinutes(window.startTime) <= this.timeToMinutes(fromTime)) {
+            continue;
+          }
+
+          if (isToday && this.timeToMinutes(window.startTime) <= this.nowMinutes()) {
+            continue;
+          }
+
+          const isTaken = bookedAppointments.some(
+            (appt) =>
+              appt.id !== excludeAppointmentId &&
+              appt.startTime.substring(0, 5) === window.startTime &&
+              appt.endTime.substring(0, 5) === window.endTime,
+          );
+
+          if (!isTaken) {
+            const isRecurring = entry instanceof RecurringAvailability;
+
+            return {
+              appointmentDate: cursorDate,
+              startTime: window.startTime,
+              endTime: window.endTime,
+              schedulingType: entry.type,
+              recurringAvailabilityId: isRecurring ? entry.id : undefined,
+              customAvailabilityId: !isRecurring ? entry.id : undefined,
+            };
+          }
+        }
+      }
+
+      const next = new Date(`${cursorDate}T00:00:00`);
+      next.setDate(next.getDate() + 1);
+      cursorDate = next.toISOString().slice(0, 10);
+    }
+
+    return null;
   }
 
   private generateWindows(
@@ -574,12 +711,289 @@ async cancelAppointment(
     );
   }
 
+  this.assertOutsideCutoff(
+    appointment.appointmentDate,
+    appointment.startTime,
+    'cancel',
+  );
+
   appointment.status =
     AppointmentStatus.CANCELLED;
 
   return await this.appointmentRepository.save(
     appointment,
   );
+}
+
+// ==========================================
+// RESCHEDULE APPOINTMENT
+//
+// Runs inside a SERIALIZABLE transaction with a pessimistic lock on the
+// appointment row (and on any conflicting slot) so that releasing the
+// old slot and reserving the new one happen atomically: this is a
+// single row update (same appointment id gets new date/time/token), so
+// there is never a window where the appointment holds neither slot nor
+// two slots at once. The DB-level unique constraint on
+// (doctor, appointmentDate, startTime, endTime) is the final backstop
+// against a race condition slipping past the application-level check.
+// ==========================================
+async rescheduleAppointment(
+  appointmentId: number,
+  userId: number,
+  dto: RescheduleAppointmentDto,
+) {
+  if (!Number.isInteger(appointmentId) || appointmentId <= 0) {
+    throw new BadRequestException('Invalid appointment id');
+  }
+
+  if (
+    !dto.appointmentDate ||
+    Number.isNaN(new Date(`${dto.appointmentDate}T00:00:00`).getTime())
+  ) {
+    throw new BadRequestException('Invalid appointment date');
+  }
+
+  if (!dto.startTime) {
+    throw new BadRequestException(
+      'startTime is required (pick one of the generated slots/waves for this availability)',
+    );
+  }
+
+  if (dto.recurringAvailabilityId && dto.customAvailabilityId) {
+    throw new BadRequestException(
+      'Provide only one availability reference, not both',
+    );
+  }
+
+  const queryRunner = this.dataSource.createQueryRunner();
+  await queryRunner.connect();
+  await queryRunner.startTransaction('SERIALIZABLE');
+
+  try {
+    const patient = await queryRunner.manager.findOne(PatientProfile, {
+      where: { user: { id: userId } },
+      relations: { user: true },
+    });
+
+    if (!patient) {
+      throw new NotFoundException('Patient profile not found');
+    }
+
+    const appointment = await queryRunner.manager.findOne(Appointment, {
+      where: { id: appointmentId },
+      relations: {
+        patient: true,
+        doctor: true,
+        recurringAvailability: true,
+        customAvailability: true,
+      },
+      lock: { mode: 'pessimistic_write' },
+    });
+
+    if (!appointment) {
+      throw new NotFoundException('Appointment not found');
+    }
+
+    if (appointment.patient.id !== patient.id) {
+      throw new BadRequestException('Unauthorized access');
+    }
+
+    if (appointment.status === AppointmentStatus.CANCELLED) {
+      throw new BadRequestException(
+        'Cannot reschedule a cancelled appointment',
+      );
+    }
+
+    // 30-minute cutoff applies to the slot being given up.
+    this.assertOutsideCutoff(
+      appointment.appointmentDate,
+      appointment.startTime,
+      'reschedule',
+    );
+
+    if (this.isDateInPast(dto.appointmentDate)) {
+      throw new BadRequestException('Cannot reschedule to a past time');
+    }
+
+    const doctor = appointment.doctor;
+
+    // Resolve the target availability: an explicit override in the dto,
+    // otherwise reuse the appointment's current availability reference.
+    let recurringAvailability: RecurringAvailability | null = null;
+    let customAvailability: CustomAvailability | null = null;
+
+    const wantsRecurring =
+      dto.recurringAvailabilityId !== undefined ||
+      (dto.customAvailabilityId === undefined &&
+        appointment.recurringAvailability);
+
+    if (wantsRecurring) {
+      const recurringId =
+        dto.recurringAvailabilityId ?? appointment.recurringAvailability?.id;
+
+      recurringAvailability = await queryRunner.manager.findOne(
+        RecurringAvailability,
+        {
+          where: { id: recurringId },
+          relations: { doctorProfile: true },
+        },
+      );
+
+      if (!recurringAvailability) {
+        throw new NotFoundException('Recurring availability not found');
+      }
+
+      if (recurringAvailability.doctorProfile.id !== doctor.id) {
+        throw new BadRequestException(
+          'Availability does not belong to this doctor',
+        );
+      }
+
+      const expectedDayOfWeek = this.getDayOfWeek(dto.appointmentDate);
+      if (recurringAvailability.dayOfWeek !== expectedDayOfWeek) {
+        throw new BadRequestException(
+          'Conflicting schedule: this availability does not apply to the selected date',
+        );
+      }
+    } else {
+      const customId =
+        dto.customAvailabilityId ?? appointment.customAvailability?.id;
+
+      customAvailability = await queryRunner.manager.findOne(
+        CustomAvailability,
+        {
+          where: { id: customId },
+          relations: { doctorProfile: true },
+        },
+      );
+
+      if (!customAvailability) {
+        throw new NotFoundException('Custom availability not found');
+      }
+
+      if (customAvailability.doctorProfile.id !== doctor.id) {
+        throw new BadRequestException(
+          'Availability does not belong to this doctor',
+        );
+      }
+
+      if (customAvailability.date !== dto.appointmentDate) {
+        throw new BadRequestException(
+          'Conflicting schedule: this availability does not apply to the selected date',
+        );
+      }
+    }
+
+    const source = recurringAvailability ?? customAvailability!;
+    const schedulingType = source.type;
+
+    // Prevent "rescheduling" to the exact same slot it's already in.
+    const sameRecurring =
+      (recurringAvailability?.id ?? null) ===
+      (appointment.recurringAvailability?.id ?? null);
+    const sameCustom =
+      (customAvailability?.id ?? null) ===
+      (appointment.customAvailability?.id ?? null);
+
+    if (
+      appointment.appointmentDate === dto.appointmentDate &&
+      appointment.startTime.substring(0, 5) === dto.startTime &&
+      sameRecurring &&
+      sameCustom
+    ) {
+      throw new BadRequestException(
+        'New slot is the same as the current appointment',
+      );
+    }
+
+    const windows = this.generateWindows(
+      source.startTime,
+      source.endTime,
+      source.duration,
+      source.bufferTime ?? 0,
+    );
+
+    const slotIndex = windows.findIndex((w) => w.startTime === dto.startTime);
+    const matchedWindow = slotIndex === -1 ? undefined : windows[slotIndex];
+
+    if (!matchedWindow) {
+      throw new BadRequestException(
+        schedulingType === AvailabilityType.WAVE
+          ? 'Requested wave does not exist for this availability'
+          : 'Requested slot does not exist for this availability',
+      );
+    }
+
+    if (
+      dto.appointmentDate === this.todayIso() &&
+      this.timeToMinutes(matchedWindow.startTime) <= this.nowMinutes()
+    ) {
+      throw new BadRequestException('Cannot reschedule to a past time');
+    }
+
+    // Conflict check under the same transaction/lock so a concurrent
+    // reschedule/booking can't slip in between the check and the save.
+    const conflict = await queryRunner.manager.findOne(Appointment, {
+      where: {
+        doctor: { id: doctor.id },
+        appointmentDate: dto.appointmentDate,
+        startTime: matchedWindow.startTime,
+        status: AppointmentStatus.BOOKED,
+      },
+      lock: { mode: 'pessimistic_write' },
+    });
+
+    if (conflict && conflict.id !== appointment.id) {
+      const suggestedSlot = await this.findNextAvailableSlot(
+        doctor.id,
+        dto.appointmentDate,
+        matchedWindow.startTime,
+        appointment.id,
+      );
+
+      throw new BadRequestException({
+        message:
+          schedulingType === AvailabilityType.WAVE
+            ? 'This wave is already full'
+            : 'This slot has already been booked',
+        suggestedSlot,
+      });
+    }
+
+    // Release the old slot and reserve the new one as a single atomic
+    // update to the same row.
+    appointment.recurringAvailability = recurringAvailability ?? undefined;
+    appointment.customAvailability = customAvailability ?? undefined;
+    appointment.appointmentDate = dto.appointmentDate;
+    appointment.schedulingType = schedulingType;
+    appointment.startTime = matchedWindow.startTime;
+    appointment.endTime = matchedWindow.endTime;
+    appointment.tokenNumber = slotIndex + 1;
+    appointment.status = AppointmentStatus.BOOKED;
+
+    const saved = await queryRunner.manager.save(appointment);
+    await queryRunner.commitTransaction();
+
+    return {
+      message: 'Appointment rescheduled successfully',
+      appointment: saved,
+    };
+  } catch (error) {
+    await queryRunner.rollbackTransaction();
+
+    // Postgres unique_violation on the (doctor, date, start, end)
+    // constraint - the last-resort guard if two reschedules raced past
+    // the application-level lock/check above.
+    if ((error as { code?: string })?.code === '23505') {
+      throw new BadRequestException(
+        'This slot was just booked by someone else. Please try another slot.',
+      );
+    }
+
+    throw error;
+  } finally {
+    await queryRunner.release();
+  }
 }
 
 }
